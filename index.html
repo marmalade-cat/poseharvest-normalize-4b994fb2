@@ -1,0 +1,144 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>PoseHarvest Normalize Prototype</title>
+<style>
+body{font-family:sans-serif;max-width:800px;margin:2rem auto;color:#222}
+input,button{font-size:1rem}
+textarea{width:100%;height:8rem}
+.file{margin:.5rem 0;padding:.4rem;border:1px dashed #999}
+.record{background:#f8f4e8;padding:.4rem;margin:.3rem 0;border-left:4px solid #e67}
+</style>
+</head>
+<body>
+<h2>PoseHarvest & Normalize — Prototype</h2>
+<p>Drop files (.csv, .json, .jpg) or use chooser.</p>
+<input id="files" type="file" multiple /> <button id="clear">Clear</button>
+<div id="list"></div>
+<h3>Normalized Output</h3>
+<button id="downloadCsv">Download CSV</button>
+<button id="downloadJson">Download JSON</button>
+<pre id="out"></pre>
+
+<script>
+// Minimal EXIF parse for DateTime and Orientation from JPEG binary (not full library)
+function getExifFromJpeg(buffer){
+  const view = new DataView(buffer);
+  // JPEG starts 0xFFD8. Search for APP1 (0xFFE1)
+  let offset=2;
+  while(offset < view.byteLength){
+    if(view.getUint8(offset)!==0xFF) break;
+    const marker = view.getUint8(offset+1);
+    const size = view.getUint16(offset+2);
+    if(marker===0xE1){ // APP1
+      // Read as ASCII
+      const start = offset+4; // skip marker(2) + size(2)
+      const tag = String.fromCharCode.apply(null, new Uint8Array(buffer.slice(start,start+4)));
+      if(tag==='Exif'){
+        // Very small, try to find ASCII DateTime and Orientation strings
+        const data = new Uint8Array(buffer.slice(start));
+        const text = Array.from(data).map(b=> (b>=32 && b<127)?String.fromCharCode(b):'.').join('');
+        const dtm = text.match(/(\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2})/);
+        const orient = text.match(/Orientation\x00\x00.*?\x00\x00(\x00\x01|\x00\x02|\x00\x03|\x00\x04|\x00\x05|\x00\x06|\x00\x07|\x00\x08)/s);
+        return {datetime: dtm?dtm[1]:null, orientation: orient?parseInt(orient[1].split('\x00').pop()):null};
+      }
+    }
+    offset += 2 + size;
+  }
+  return {datetime:null, orientation:null};
+}
+
+function csvToRows(text){
+  const lines = text.trim().split(/\r?\n/).filter(Boolean);
+  const headers = lines[0].split(/,|;|\t/).map(h=>h.trim());
+  return lines.slice(1).map(l=>{
+    const cols = l.split(/,|;|\t/);
+    const obj = {};
+    headers.forEach((h,i)=> obj[h]=cols[i]!==undefined?cols[i].trim():"");
+    return obj;
+  });
+}
+
+function normalizeRecord(base){
+  const r = {id: base.id||Math.random().toString(36).slice(2,9), source_filename: base.filename||'', type: base.type||'unknown', timestamp:'', pose:{}};
+  if(base.type==='csv' || base.type==='json'){
+    // If row includes time-like fields, try common names
+    const t = base.row.timestamp||base.row.time||base.row.date||base.row.datetime||base.row.DateTime;
+    if(t) r.timestamp = (new Date(t)).toISOString();
+    ['x','y','z','yaw','pitch','roll'].forEach(k=>{ if(base.row[k]!==undefined) r.pose[k]=Number(base.row[k]) });
+  }
+  if(base.type==='image'){
+    if(base.exif && base.exif.datetime) {
+      // convert EXIF 2001:02:03 04:05:06 -> ISO
+      const d = base.exif.datetime.replace(/:/, '-').replace(/:/, '-');
+      // crude: replace first two colons
+      const iso = d.replace(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/, '$1-$2-$3T$4:$5:$6Z');
+      r.timestamp = iso;
+    }
+    if(base.exif && base.exif.orientation) r.pose.exif_orientation = base.exif.orientation;
+  }
+  return r;
+}
+
+const filesEl = document.getElementById('files');
+const list = document.getElementById('list');
+const out = document.getElementById('out');
+let records = [];
+
+filesEl.addEventListener('change', async (e)=>{
+  const files = Array.from(e.target.files);
+  for(const f of files){
+    const item = document.createElement('div'); item.className='file'; item.textContent = f.name;
+    list.appendChild(item);
+    const name = f.name.toLowerCase();
+    if(name.endsWith('.csv')){
+      const text = await f.text();
+      const rows = csvToRows(text);
+      rows.forEach(r=> records.push(normalizeRecord({filename:f.name,type:'csv',row:r}))); 
+    } else if(name.endsWith('.json')){
+      try{ const j = JSON.parse(await f.text());
+        if(Array.isArray(j)) j.forEach(r=> records.push(normalizeRecord({filename:f.name,type:'json',row:r}))); else records.push(normalizeRecord({filename:f.name,type:'json',row:j}));
+      }catch(err){ item.appendChild(Object.assign(document.createElement('small'),{textContent:' JSON parse error'})); }
+    } else if(name.endsWith('.jpg')||name.endsWith('.jpeg')){
+      const buffer = await f.arrayBuffer();
+      const exif = getExifFromJpeg(buffer);
+      records.push(normalizeRecord({filename:f.name,type:'image',exif}));
+    } else {
+      item.appendChild(Object.assign(document.createElement('small'),{textContent:' unsupported'}));
+    }
+  }
+  render();
+});
+
+document.getElementById('clear').onclick = ()=>{records=[]; list.textContent=''; render(); filesEl.value='';}
+
+document.getElementById('downloadJson').onclick = ()=>{
+  const blob = new Blob([JSON.stringify(records,null,2)],{type:'application/json'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download='normalized.json'; a.click();
+}
+
+document.getElementById('downloadCsv').onclick = ()=>{
+  // flatten pose keys
+  const keys = ['id','source_filename','type','timestamp','pose.x','pose.y','pose.z','pose.yaw','pose.pitch','pose.roll','pose.exif_orientation'];
+  const lines = [keys.join(',')];
+  records.forEach(r=>{
+    const vals = keys.map(k=>{
+      const parts = k.split('.');
+      let v = r[parts[0]];
+      if(parts[1] && v) v = v[parts[1]];
+      return (v===undefined||v===null)?'':('"'+String(v).replace(/"/g,'""')+'"');
+    });
+    lines.push(vals.join(','));
+  });
+  const blob = new Blob([lines.join('\n')],{type:'text/csv'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download='normalized.csv'; a.click();
+}
+
+function render(){
+  out.textContent = JSON.stringify(records,null,2);
+}
+
+</script>
+</body>
+</html>
